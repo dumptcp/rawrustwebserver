@@ -264,3 +264,4 @@ What is different:
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
