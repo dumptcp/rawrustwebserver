@@ -64,7 +64,8 @@ use tokio::{
 const KEEP_ALIVE: Duration = Duration::from_secs(960);
 const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(60);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_HEAD: usize = 32 * 1024;
+/// An unfinished request head this long gets 431 (actix's limit, MAX_BUFFER_SIZE).
+const MAX_HEAD: usize = 128 * 1024;
 const MAX_HEADERS: usize = 96; // actix's limit; more gets 431
 /// Bodies up to this size are copied next to their head (one send for pipelined
 /// batches); larger ones are written from shared memory with writev.
@@ -968,7 +969,7 @@ async fn connection(mut s: TcpStream, files: &'static Files, mut stop: watch::Re
         if !out.is_empty() && !flush(&mut s, &mut out, &[]).await {
             return;
         }
-        if buf.len() > MAX_HEAD {
+        if buf.len() >= MAX_HEAD {
             bare_error(&mut out, StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
             let _ = flush(&mut s, &mut out, &[]).await;
             return;

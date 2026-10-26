@@ -2,7 +2,7 @@
 
 A fast static file server written in Rust, without a web framework. It is the same server as [dumptcp/rustwebserver](https://github.com/dumptcp/rustwebserver), with the same eight versions and the same responses, rebuilt on a small purpose-built HTTP/1.1 engine ([tokio](https://tokio.rs) + [httparse](https://github.com/seanmonstar/httparse)) instead of Actix Web, so each request costs less CPU. Run a few commands, and your site is live.
 
-**Benchmark:** on a 2-CPU DigitalOcean server, about 100,000 requests per second on one CPU core, using 8–10% less CPU per request than the Actix Web version. See [Benchmarks](#benchmarks).
+**Benchmark:** about 90,000 requests per second from one CPU core of a 2-CPU DigitalOcean server, answering 4–8% more requests per CPU-second than the Actix Web version. See [Benchmarks](#benchmarks).
 
 ---
 
@@ -242,20 +242,22 @@ What is different:
 
 ## Benchmarks
 
-`cache-all` on a DigitalOcean server with 2 CPUs (AMD EPYC 9555P, Ubuntu 26.04, Rust 1.99.1), both versions built from source on the server and serving the same small site (one 14 KB page, two icons and `robots.txt`):
+`cache-all` on a DigitalOcean server with 2 CPUs (AMD EPYC 9555P, Ubuntu 26.04, Rust 1.99.1), both versions built from source on the server (this repository and [dumptcp/rustwebserver](https://github.com/dumptcp/rustwebserver)) and serving the same real site: one 14 KB page (sent as 3.3 KB with Brotli) and a 2 KB icon. Measured on October 26, 2026.
 
 | Test | Actix Web: requests per second | This server: requests per second | Actix Web: requests per CPU-second | This server: requests per CPU-second |
 |---|---|---|---|---|
-| Home page, Brotli (256 connections) | 99,746 | 102,462 | 110,049 | **121,144 (+10%)** |
-| `304 Not Modified` (256 connections) | 110,873 | 107,007 | 128,263 | 128,849 (+0%) |
-| All four files in turn (256 connections) | 102,030 | 102,458 | 114,297 | **123,337 (+8%)** |
-| New connection every 10 requests (256 connections) | 65,688 | 67,038 | 78,512 | **85,435 (+9%)** |
-| Home page, Brotli (1,000 connections) | 97,339 | 98,727 | 107,995 | **118,061 (+9%)** |
+| Home page, Brotli (256 connections) | 89,319 | 90,162 | 99,194 | **105,714 (+7%)** |
+| `304 Not Modified` (256 connections) | 96,001 | 95,879 | 111,055 | **115,549 (+4%)** |
+| Both files in turn (256 connections) | 88,812 | 90,060 | 98,900 | **106,483 (+8%)** |
+| New connection every 10 requests (256 connections) | 57,230 | 57,304 | 70,985 | **75,445 (+6%)** |
+| Home page, Brotli (1,000 connections) | 85,661 | 85,956 | 96,056 | **101,734 (+6%)** |
 
 - **Requests per CPU-second** is how many requests one CPU core can answer with this server. It is the fair comparison here: with only 2 CPUs, the load generator had one of them and could not push either server to its limit, which is why the requests per second are so close.
-- **No failed requests** in any run.
+- **Latency:** half of all responses came back just as fast with both (1.3–1.4 ms at 256 connections, 5.8 ms at 1,000). The slowest 1% took a little longer with this server in three tests: 3.9 ms against 3.3 ms for `304`, 5.3 ms against 4.1 ms with new connections, and 14.5 ms against 12.1 ms with 1,000 connections.
+- **Memory:** 4.9 MB idle (Actix Web: 5.3 MB), 27.6 MB at most with 1,000 connections open (Actix Web: 23.2 MB).
+- **No failed requests** in 37.7 million.
 
-**How it was measured:** the server on CPU 0 (one worker), the load generator (wrk 4.1.0) on CPU 1, over the loopback interface. HTTP/1.1 with keep-alive, requests sent the way Cloudflare sends them (`Accept-Encoding: br, gzip`), 15 seconds per test after a 3 second warm-up, 3 rounds alternating which version went first, averaged. Your numbers will differ: a real server has a network in between and often has fewer or slower cores.
+**How it was measured:** the server on CPU 0 (one worker), the load generator (wrk 4.1.0, one thread) on CPU 1, over the loopback interface. HTTP/1.1 with keep-alive, requests sent the way Cloudflare sends them (`Accept-Encoding: br, gzip`), 15 seconds per test after a 3 second warm-up, 3 rounds alternating which version went first, averaged. Your numbers will differ: a real server has a network in between, and Cloudflare's cache answers most requests before they reach it.
 
 ---
 
