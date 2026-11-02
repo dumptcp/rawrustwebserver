@@ -38,7 +38,9 @@ use std::{
     cell::RefCell,
     io::Write,
     collections::HashMap,
+    hash::{BuildHasherDefault, Hasher},
     io::{self, IoSlice},
+    mem::MaybeUninit,
     net::SocketAddr,
     path::Path,
     sync::{
@@ -318,6 +320,11 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+/// `needle` must be lowercase.
+fn contains_ignore_case(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
+}
+
 fn redirect_target(dir: &str) -> String {
     let encoded = utf8_percent_encode(dir, REDIRECT_KEEP).to_string();
     format!("/{}", encoded.trim_start_matches('/'))
@@ -361,7 +368,51 @@ struct File {
     not_modified: Bytes,
     is_404_page: bool,
 }
-type Files = HashMap<String, File>;
+
+/// FxHash: a few multiplies per lookup instead of SipHash's rounds. Every key is a
+/// path from `www`, chosen by the site owner, so there is no hash flooding to defend
+/// against; requests only look keys up.
+#[derive(Default)]
+struct FxHasher(u64);
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, w: u64) {
+        self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+impl Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            self.add(u64::from_le_bytes(c.try_into().unwrap()));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut last = [0u8; 8];
+            last[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(last));
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, b: u8) {
+        self.add(u64::from(b));
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Keyed by path inside `www`. Every folder with an index.html is also listed under
+/// its own path ("" for the top, "docs/" for docs/index.html), sharing the same File,
+/// so `/` and `/docs/` are found without building a key per request.
+type Files = HashMap<String, Arc<File>, BuildHasherDefault<FxHasher>>;
+
+/// Whether `key` is a folder entry added by `load` rather than a file of its own.
+fn is_folder_key(key: &str) -> bool {
+    key.is_empty() || key.ends_with('/')
+}
 
 fn push_header(h: &mut Vec<u8>, name: &str, value: &str) {
     h.extend_from_slice(name.as_bytes());
@@ -434,7 +485,7 @@ fn placeholder() -> PickTable {
 }
 
 fn load(root: &Path) -> Files {
-    let mut files = HashMap::new();
+    let mut files = Files::default();
     let walker = walkdir_files(root);
     for (rel, body) in walker {
         let ctype = content_type(&rel);
@@ -475,7 +526,7 @@ fn load(root: &Path) -> Files {
         };
         // The 404 page is served under every missing path; its own URL still gets a 200.
         f.pick = ArcSwap::from_pointee(pick_table(&f, br));
-        files.insert(rel, f);
+        files.insert(rel, Arc::new(f));
     }
     if let Some(f) = files.get("404.html") {
         let mut page = File {
@@ -491,8 +542,16 @@ fn load(root: &Path) -> Files {
         let cur = f.pick.load();
         let br = cur[ACCEPT_BR].enc.map(|_| cur[ACCEPT_BR].body.clone());
         page.pick = ArcSwap::from_pointee(pick_table(&page, br));
-        files.insert(NOT_FOUND_KEY.to_owned(), page);
+        files.insert(NOT_FOUND_KEY.to_owned(), Arc::new(page));
     }
+    let folders: Vec<(String, Arc<File>)> = files
+        .iter()
+        .filter_map(|(k, f)| {
+            let dir = k.strip_suffix("index.html")?;
+            (dir.is_empty() || dir.ends_with('/')).then(|| (dir.to_owned(), Arc::clone(f)))
+        })
+        .collect();
+    files.extend(folders);
     files
 }
 
@@ -528,7 +587,11 @@ fn walkdir_files(root: &Path) -> Vec<(String, Vec<u8>)> {
 }
 
 fn recompress(files: &Files) {
-    let todo: Vec<&File> = files.values().filter(|f| !f.ranges).collect();
+    let todo: Vec<&File> = files
+        .iter()
+        .filter(|(k, f)| !is_folder_key(k) && !f.ranges)
+        .map(|(_, f)| &**f)
+        .collect();
     let next = AtomicUsize::new(0);
     let workers = thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1));
     thread::scope(|s| {
@@ -628,11 +691,10 @@ fn read_req<'b>(r: &httparse::Request<'_, 'b>) -> Req<'b> {
         } else if n.eq_ignore_ascii_case("if-range") {
             q.if_range = Some(h.value);
         } else if n.eq_ignore_ascii_case("connection") {
-            let v = h.value.to_ascii_lowercase();
-            if contains(&v, b"close") {
+            if contains_ignore_case(h.value, b"close") {
                 q.close = true;
             }
-            if contains(&v, b"keep-alive") {
+            if contains_ignore_case(h.value, b"keep-alive") {
                 keep_alive_token = true;
             }
         } else if n.eq_ignore_ascii_case("content-length") {
@@ -659,6 +721,10 @@ fn read_req<'b>(r: &httparse::Request<'_, 'b>) -> Req<'b> {
 }
 
 fn accept_mask(ae: &[u8]) -> usize {
+    // What Cloudflare sends on every request; skip parsing it.
+    if ae == b"gzip, br" || ae == b"br, gzip" {
+        return ACCEPT_BR;
+    }
     accept_mask_of(std::str::from_utf8(ae).unwrap_or(""))
 }
 
@@ -813,13 +879,8 @@ fn handle(files: &Files, q: &Req, out: &mut Vec<u8>) -> Reply {
     }
 
     let key = p.strip_prefix('/').unwrap_or(&p);
-    let f = if key.is_empty() || key.ends_with('/') {
-        files.get(&format!("{key}index.html"))
-    } else {
-        files.get(key)
-    };
-    let Some(f) = f else {
-        if !p.ends_with('/') && files.contains_key(&format!("{key}/index.html")) {
+    let Some(f) = files.get(key) else {
+        if !p.ends_with('/') && files.contains_key(&format!("{key}/")) {
             let loc = redirect_target(&format!("{p}/")) + &query_suffix(query);
             plain(out, StatusCode::MOVED_PERMANENTLY, REDIRECT_CACHE_CONTROL, &[("location", loc.as_str())], head);
             return done(keep);
@@ -926,9 +987,10 @@ async fn connection(mut s: TcpStream, files: &'static Files, mut stop: watch::Re
         // Answer every complete request already buffered (pipelining keeps order).
         let mut pos = 0;
         loop {
-            let mut hs = [httparse::EMPTY_HEADER; MAX_HEADERS];
-            let mut r = httparse::Request::new(&mut hs);
-            let (consumed, reply) = match r.parse(&buf[pos..]) {
+            // Left uninitialised: httparse only reads the slots it has filled.
+            let mut hs = [const { MaybeUninit::<httparse::Header>::uninit() }; MAX_HEADERS];
+            let mut r = httparse::Request::new(&mut []);
+            let (consumed, reply) = match r.parse_with_uninit_headers(&buf[pos..], &mut hs) {
                 Ok(httparse::Status::Complete(n)) => {
                     let q = read_req(&r);
                     let start = out.len();
@@ -1042,11 +1104,12 @@ fn main() {
         Err(e) => eprintln!("could not raise open file limit: {e}"),
     }
     let files: &'static Files = Box::leak(Box::new(load(Path::new(&root))));
-    if files.is_empty() {
+    let count = files.keys().filter(|k| !is_folder_key(k)).count();
+    if count == 0 {
         eprintln!("no files found under {root}");
         std::process::exit(1);
     }
-    println!("loaded {} files from {root}", files.len());
+    println!("loaded {count} files from {root}");
     return_large_blocks_when_freed();
     return_freed_memory_to_the_system();
     if COMPRESSION {

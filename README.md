@@ -83,22 +83,25 @@ All eight folders contain the same code. The only difference is the **settings**
 
 ## Step 3 — Add your website files
 
-Put the `Cargo.toml` and `main.rs` from the folder you picked in `/root`, and your `index.html` and other site files in `/root/www`:
+Put the `Cargo.toml`, `Cargo.lock` and `main.rs` from the folder you picked in `/root`, and your `index.html` and other site files in `/root/www`:
 
 ```
 /root/
 ├── Cargo.toml
+├── Cargo.lock
 ├── main.rs
 └── /root/www/
     └── index.html
 ```
+
+`Cargo.lock` pins the exact library versions this server was tested with, so your build matches it.
 
 ---
 
 ## Step 4 — Build
 
 ```bash
-cargo build --release
+cargo build --release --locked
 ```
 
 ---
@@ -116,7 +119,7 @@ Recommended: also turn on **Always Use HTTPS** (SSL/TLS → Edge Certificates), 
 
 Recommended: also turn on **Smart Tiered Cache** (Caching → Tiered Cache). It's free on every plan and makes Cloudflare's data centers fetch files from one another instead of each one asking your server.
 
-Cloudflare caches images, CSS, JS, fonts, video and audio by default, but **not HTML** (it decides by file extension). With `cache-assets-only` that is exactly right: every page is checked with your server (a `304 Not Modified` when nothing changed) and everything else is answered from Cloudflare's cache. If you picked `cache-all` or `cache-1-minute` and want Cloudflare to cache your pages too, add a **Cache Rule** (Caching → Cache Rules) for your site with **Eligible for cache**, Edge TTL **Use cache-control header if present**, and Browser TTL **Respect origin**, so the times this server sends are the ones Cloudflare uses.
+Cloudflare caches images, CSS, JS, fonts, video and audio by default, but **not HTML or JSON** (it decides by file extension). With `cache-assets-only` that is exactly right: every page is checked with your server (a `304 Not Modified` when nothing changed) and everything else is answered from Cloudflare's cache. If you picked `cache-all` or `cache-1-minute` and want Cloudflare to cache your pages too, add a **Cache Rule** (Caching → Cache Rules) for your site with **Eligible for cache**, Edge TTL **Use cache-control header if present**, and Browser TTL **Respect origin**, so the times this server sends are the ones Cloudflare uses. To have Cloudflare cache `.json` files too, edit or add a Cache Rule for **File extension is in** `json` with **Eligible for cache** and Edge TTL **Use cache-control header if present**.
 
 ---
 
@@ -199,6 +202,8 @@ cargo clean
 - Pages can only load things from your own site unless you allow more. If you use Google Fonts, analytics, a CDN or embeds, see the next section.
 - If you update a file while using `cache-all`, you may need to clear your browser cache or Cloudflare cache to see the change.
 - `cache-assets-only` is the safest choice for most people.
+- Every response tells browsers to use HTTPS for a year on your domain **and all its subdomains** (`Strict-Transport-Security` with `includeSubDomains`). Make sure every subdomain works over HTTPS (with Cloudflare proxying them, they do). Otherwise, remove `; includeSubDomains` from `strict-transport-security` in `main.rs`.
+- `cloudflare.conf` lists Cloudflare's addresses as published at [cloudflare.com/ips](https://www.cloudflare.com/ips/). They rarely change, but if Cloudflare adds one, update both lists in the file and load it again.
 
 ---
 
