@@ -950,15 +950,22 @@ fn handle(files: &Files, q: &Req, out: &mut Vec<u8>) -> Reply {
 
 // ---------------------------------------------------------------- connection loop
 
+/// WRITE_TIMEOUT limits each write call (time without progress), not the whole
+/// response, so a slow but steady reader can still receive a large file.
 async fn write_two(s: &mut TcpStream, mut a: &[u8], mut b: &[u8]) -> io::Result<()> {
     while !a.is_empty() || !b.is_empty() {
-        let n = if a.is_empty() {
-            s.write(b).await?
-        } else if b.is_empty() {
-            s.write(a).await?
-        } else {
-            s.write_vectored(&[IoSlice::new(a), IoSlice::new(b)]).await?
+        let write = async {
+            if a.is_empty() {
+                s.write(b).await
+            } else if b.is_empty() {
+                s.write(a).await
+            } else {
+                s.write_vectored(&[IoSlice::new(a), IoSlice::new(b)]).await
+            }
         };
+        let n = timeout(WRITE_TIMEOUT, write)
+            .await
+            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
         if n == 0 {
             return Err(io::ErrorKind::WriteZero.into());
         }
@@ -970,7 +977,7 @@ async fn write_two(s: &mut TcpStream, mut a: &[u8], mut b: &[u8]) -> io::Result<
 }
 
 async fn flush(s: &mut TcpStream, out: &mut Vec<u8>, body: &[u8]) -> bool {
-    let ok = matches!(timeout(WRITE_TIMEOUT, write_two(s, out, body)).await, Ok(Ok(())));
+    let ok = write_two(s, out, body).await.is_ok();
     out.clear();
     ok
 }
@@ -1161,11 +1168,14 @@ fn main() {
         .collect();
     println!("listening on {addr} with {n} per-core workers");
 
-    let (stop_tx, stop_rx) = watch::channel(false);
+    // One stop channel per worker, so a connection waiting for its next request only
+    // touches its own core's channel, never a lock shared with the other cores.
+    let mut stop_txs = Vec::with_capacity(n);
     let threads: Vec<_> = listeners
         .into_iter()
         .map(|std_listener| {
-            let mut stop = stop_rx.clone();
+            let (stop_tx, mut stop) = watch::channel(false);
+            stop_txs.push(stop_tx);
             thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -1206,7 +1216,9 @@ fn main() {
         });
     println!("shutting down: finishing in-flight requests (up to {} s)", SHUTDOWN_TIMEOUT.as_secs());
     SHUTTING_DOWN.store(true, Ordering::SeqCst);
-    let _ = stop_tx.send(true);
+    for stop_tx in &stop_txs {
+        let _ = stop_tx.send(true);
+    }
     for t in threads {
         let _ = t.join();
     }
