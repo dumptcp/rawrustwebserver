@@ -178,9 +178,16 @@ fn content_type(rel: &str) -> String {
         "csv" => "text/csv; charset=utf-8",
         "md" => "text/markdown; charset=utf-8",
         "vtt" => "text/vtt; charset=utf-8",
+        "yaml" | "yml" => "text/x-yaml; charset=utf-8",
+        "toml" => "text/x-toml; charset=utf-8",
+        "ini" | "conf" | "cfg" | "log" => "text/plain; charset=utf-8",
+        "xslt" | "dtd" => "text/xml; charset=utf-8",
+        "vcf" => "text/x-vcard; charset=utf-8",
         "wasm" => "application/wasm",
         "pdf" => "application/pdf",
         "zip" => "application/zip",
+        "tgz" => "application/x-compressed",
+        "rar" => "application/x-rar-compressed",
 
         "ico" => "image/x-icon",
         "png" => "image/png",
@@ -202,6 +209,7 @@ fn content_type(rel: &str) -> String {
         "mp4" => "video/mp4",
         "m4v" => "video/x-m4v",
         "mov" => "video/quicktime",
+        "avi" => "video/x-msvideo",
         "webm" => "video/webm",
         "ogv" => "video/ogg",
         "3gp" => "video/3gpp",
@@ -216,6 +224,8 @@ fn content_type(rel: &str) -> String {
         "wav" => "audio/wav",
         "flac" => "audio/flac",
         "weba" => "audio/webm",
+        "mid" | "midi" => "audio/mid",
+        "aif" | "aiff" => "audio/aiff",
         _ => "",
     };
     if !fixed.is_empty() {
@@ -721,6 +731,9 @@ fn read_req<'b>(r: &httparse::Request<'_, 'b>) -> Req<'b> {
 }
 
 fn accept_mask(ae: &[u8]) -> usize {
+    if !COMPRESSION {
+        return 0;
+    }
     // What Cloudflare sends on every request; skip parsing it.
     if ae == b"gzip, br" || ae == b"br, gzip" {
         return ACCEPT_BR;
@@ -1002,6 +1015,13 @@ async fn connection(mut s: TcpStream, files: &'static Files, mut stop: watch::Re
             let mut hs = [const { MaybeUninit::<httparse::Header>::uninit() }; MAX_HEADERS];
             let mut r = httparse::Request::new(&mut []);
             let (consumed, reply) = match r.parse_with_uninit_headers(&buf[pos..], &mut hs) {
+                // A head that arrived whole in one read can be longer than MAX_HEAD; refuse
+                // it like one still coming in, so the limit always holds.
+                Ok(httparse::Status::Complete(n)) if n > MAX_HEAD => {
+                    bare_error(&mut out, StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
+                    let _ = flush(&mut s, &mut out, &[]).await;
+                    return;
+                }
                 Ok(httparse::Status::Complete(n)) => {
                     let q = read_req(&r);
                     let start = out.len();
