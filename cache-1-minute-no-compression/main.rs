@@ -1100,7 +1100,7 @@ fn listener(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
     }
     s.set_reuse_address(true)?;
     s.set_reuse_port(true)?;
-    s.set_nodelay(true)?;
+    s.set_tcp_nodelay(true)?;
     s.set_nonblocking(true)?;
     s.bind(&addr.into())?;
     s.listen(65_535)?;
