@@ -2,7 +2,7 @@
 
 A fast static file server written in Rust, without a web framework. It is the same server as [dumptcp/rustwebserver](https://github.com/dumptcp/rustwebserver), with the same eight versions and the same responses, rebuilt on a small purpose-built HTTP/1.1 engine ([tokio](https://tokio.rs) + [httparse](https://github.com/seanmonstar/httparse)) instead of Actix Web, so each request costs less CPU. Run a few commands, and your site is live.
 
-**Benchmark:** about 108,000 requests per second from one CPU core of a 2-CPU DigitalOcean server, answering 4–10% more requests per CPU-second than Actix Web and 35–39% more than the Golang Web Server (`cache-all` on each). See [Benchmarks](#benchmarks).
+**Benchmark:** `cache-all` serving `/` with Brotli at concurrency 256 reached 79,241.9 requests per second on a 2 vCPU / 8 GB DigitalOcean droplet (AMD EPYC 9555P, oha 1.16.0, November 8–9, 2026). The load generator shares those 2 vCPUs, so the figures are relative. See [Benchmarks](#benchmarks).
 
 ---
 
@@ -274,7 +274,64 @@ What is different:
 
 ## Benchmarks
 
-### No-framework Rust webserver versus Actix Web versus Golang Web Server
+Measured November 8–9, 2026 (2026-11-08 ~11:58 PM through 12:20 AM PT) on a DigitalOcean droplet. The rawrustwebserver numbers below are from the dependency-update branch `grokbot/deps-socket2-lock-refresh` ([PR #2](https://github.com/dumptcp/rawrustwebserver/pull/2), SHA `5664126`, full `56641269adbff12455c8180651664fdc3a692d69`).
+
+### Hardware, toolchain, and method
+
+**Hardware:** DigitalOcean droplet, AMD EPYC 9555P, 2 vCPU, 8 GB RAM, Ubuntu 26.04.1 LTS, kernel `7.0.0-43-generic`.
+
+**Toolchains:** `rustc 1.99.1 (58cf8f9c3 2026-10-13)`, `go version go1.27.3 linux/amd64`, load generator `oha 1.16.0`.
+
+**Content:** an identical copy of the live `/root/www` tree at `/opt/grokbench/www`.
+
+- `index.html` — 14008 bytes plain (~3137–3538 bytes with Brotli, depending on recompression finish)
+- `/assets/main.dca5427cb9.js` — 478 bytes plain (~227 bytes with Brotli)
+
+**Variants timed:** `cache-all` and `cache-assets-only` (the recommended folder). The other six folders share the same engine and only change Cache-Control / compression settings, so they were not timed separately.
+
+**Method:**
+
+1. Release binaries were built with `cargo build --release --locked`. The Go comparison binary used `CGO_ENABLED=0 go build -trimpath -ldflags="-s -w"`.
+2. One server at a time, with `HOST=127.0.0.1 PORT=8081 ROOT=/opt/grokbench/www`, and no code patches. The live production `rawstatic` on port 80 stayed running and idle.
+3. The server was pinned to CPU 0 (`taskset -c 0`). `oha` was pinned to CPU 1 (`taskset -c 1`) with `--worker-threads 1`.
+4. Warmup was 5 seconds and discarded. Each measurement ran 30 seconds with `-w` (wait for in-flight requests at the deadline). Concurrency was 50 and 256. HTTP/1.1 keep-alive.
+5. Endpoints: `home_br` is `/` with `Accept-Encoding: br`; `home_plain` is `/` with no `Accept-Encoding`; `asset_br` is `/assets/main.dca5427cb9.js` with Brotli.
+6. Peak RSS is `VmHWM` from `/proc/<pid>/status` after each run.
+
+**Caveat:** the load generator and the server share the 2 vCPUs, so absolute requests per second are generator-limited for the faster engines. Use the numbers for relative ranking. Tool, duration, and content differ from the wrk figures in [Older results](#older-results).
+
+### rawrustwebserver
+
+| Variant | Test | Conc | RPS | p50 ms | p99 ms | Peak RSS MiB | Errors |
+|---|---|---:|---:|---:|---:|---:|---:|
+| cache-all | home_br | 50 | 85,188.5 | 0.53 | 0.91 | 7.0 | 0 |
+| cache-all | home_br | 256 | 79,241.9 | 3.08 | 4.88 | 10.6 | 0 |
+| cache-all | home_plain | 50 | 84,727.8 | 0.53 | 0.81 | 7.0 | 0 |
+| cache-all | home_plain | 256 | 78,406.8 | 3.12 | 4.90 | 11.7 | 0 |
+| cache-all | asset_br | 50 | 87,628.4 | 0.52 | 0.79 | 7.0 | 0 |
+| cache-all | asset_br | 256 | 80,455.6 | 3.02 | 4.86 | 11.9 | 0 |
+| cache-assets-only | home_br | 50 | 81,193.1 | 0.54 | 0.86 | 6.9 | 0 |
+| cache-assets-only | home_br | 256 | 78,620.8 | 3.09 | 4.88 | 10.9 | 0 |
+| cache-assets-only | home_plain | 50 | 81,571.9 | 0.54 | 0.84 | 6.9 | 0 |
+| cache-assets-only | home_plain | 256 | 78,550.1 | 3.09 | 5.36 | 11.8 | 0 |
+| cache-assets-only | asset_br | 50 | 83,121.1 | 0.53 | 1.22 | 6.9 | 0 |
+| cache-assets-only | asset_br | 256 | 80,422.4 | 3.02 | 4.77 | 11.8 | 0 |
+
+### Cross-server comparison
+
+`cache-all`, `/` with Brotli, concurrency 256. [rustwebserver](https://github.com/dumptcp/rustwebserver) is the Actix Web server; [golangwebserver](https://github.com/dumptcp/golangwebserver) is the Fiber server. In this same run those two were on their dependency-update branches: rustwebserver `grokbot/deps-actix-lock-refresh` (PR #1, SHA `ccab53630c232aa270b6f4f3005c97a52837ce17`) and golangwebserver `grokbot/deps-fasthttp-brotli` (PR #1, SHA `e469dad2c02c5d493702dfb907e7f0583a1de87c`).
+
+| Server | RPS | p50 ms | p99 ms | Peak RSS MiB | Errors |
+|---|---:|---:|---:|---:|---:|
+| rawrustwebserver (no framework) | 79,241.9 | 3.08 | 4.88 | 10.6 | 0 |
+| rustwebserver (Actix) | 77,847.3 | 3.12 | 4.91 | 9.8 | 0 |
+| golangwebserver (Fiber) | 75,811.7 | 3.35 | 6.50 | 18.4 | 0 |
+
+### Older results
+
+These figures are from an earlier wrk 4.1.0 run (2 second warm-up, 7 seconds measured, a 10 KB home page and a 3.9 KB CSS file). The tool, duration, and content differ from the oha 1.16.0 run above, so the two sets stay separate.
+
+#### No-framework Rust webserver versus Actix Web versus Golang Web Server
 
 `cache-all` of the **no-framework Rust webserver** ([dumptcp/rawrustwebserver](https://github.com/dumptcp/rawrustwebserver)), **Actix Web** ([dumptcp/rustwebserver](https://github.com/dumptcp/rustwebserver)) and the **Golang Web Server** ([dumptcp/golangwebserver](https://github.com/dumptcp/golangwebserver), Fiber v3), on a DigitalOcean server with 2 CPUs (AMD EPYC 9555P, Ubuntu 26.04, Rust 1.99.1, Go 1.27.3). Measured in November 2026.
 
