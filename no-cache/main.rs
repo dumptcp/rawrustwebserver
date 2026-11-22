@@ -33,16 +33,15 @@ const NO_TRANSFORM_ONLY_FOR_PRECOMPRESSED_TYPES: bool = true;
 const REDIRECT_CACHE_CONTROL: &str = "no-store, no-cache, must-revalidate, max-age=0";
 const ERROR_CACHE_CONTROL: &str = "no-store, no-cache, must-revalidate, max-age=0";
 
-
 use std::{
     cell::RefCell,
-    io::Write,
     collections::HashMap,
     hash::{BuildHasherDefault, Hasher},
-    io::{self, IoSlice},
+    io::Write,
+    io::{self, IoSlice, Read},
     mem::MaybeUninit,
     net::SocketAddr,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -53,19 +52,21 @@ use std::{
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use http::StatusCode;
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::watch,
     time::timeout,
 };
 
-const KEEP_ALIVE: Duration = Duration::from_secs(960);
+const KEEP_ALIVE: Duration = Duration::from_secs(75);
 const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(60);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_MAX_CONNECTIONS: usize = 4096;
+const DEFAULT_MAX_IN_MEMORY: usize = 2 * 1024 * 1024;
 /// An unfinished request head this long gets 431 (actix's limit, MAX_BUFFER_SIZE).
 const MAX_HEAD: usize = 128 * 1024;
 const MAX_HEADERS: usize = 96; // actix's limit; more gets 431
@@ -83,9 +84,19 @@ static OPEN_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
 struct Counted;
 impl Counted {
-    fn new() -> Self {
-        OPEN_CONNECTIONS.fetch_add(1, Ordering::SeqCst);
-        Counted
+    fn try_new(max: usize) -> Option<Self> {
+        loop {
+            let n = OPEN_CONNECTIONS.load(Ordering::SeqCst);
+            if n >= max {
+                return None;
+            }
+            if OPEN_CONNECTIONS
+                .compare_exchange(n, n + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Some(Counted);
+            }
+        }
     }
 }
 impl Drop for Counted {
@@ -98,7 +109,10 @@ const SECURITY: &[(&str, &str)] = &[
     ("x-content-type-options", "nosniff"),
     ("referrer-policy", "strict-origin-when-cross-origin"),
     ("x-frame-options", "DENY"),
-    ("strict-transport-security", "max-age=31536000; includeSubDomains"),
+    (
+        "strict-transport-security",
+        "max-age=31536000; includeSubDomains",
+    ),
     ("content-security-policy", CONTENT_SECURITY_POLICY_VALUE),
     ("permissions-policy", PERMISSIONS_POLICY_VALUE),
 ];
@@ -150,9 +164,30 @@ enum ByteRange {
 }
 
 fn fnv1a(data: &[u8]) -> u64 {
-    data.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
-        (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
+    fnv1a_acc(0xcbf2_9ce4_8422_2325, data)
+}
+
+fn fnv1a_acc(mut h: u64, data: &[u8]) -> u64 {
+    for b in data {
+        h = (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+fn hash_file(path: &Path) -> std::io::Result<(u64, usize)> {
+    let mut f = std::fs::File::open(path)?;
+    let mut buf = [0u8; 64 * 1024];
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut size = 0usize;
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        size = size.saturating_add(n);
+        h = fnv1a_acc(h, &buf[..n]);
+    }
+    Ok((h, size))
 }
 
 fn smaller(compressed: Option<Vec<u8>>, than: usize) -> Option<Bytes> {
@@ -270,7 +305,6 @@ fn brotli_window(size: usize) -> u32 {
     lgwin
 }
 
-
 fn parse_range(header: &str, size: usize) -> ByteRange {
     const UNIT: &str = "bytes=";
     let unit_ok = header
@@ -332,7 +366,9 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 
 /// `needle` must be lowercase.
 fn contains_ignore_case(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
+    haystack
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle))
 }
 
 fn redirect_target(dir: &str) -> String {
@@ -354,6 +390,16 @@ fn env_str(key: &str, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_owned())
 }
 
+fn env_usize(key: &str, fallback: usize) -> usize {
+    match std::env::var(key) {
+        Ok(v) if !v.is_empty() => v.parse().unwrap_or_else(|e| {
+            eprintln!("bad {key}: {e}");
+            std::process::exit(1);
+        }),
+        _ => fallback,
+    }
+}
+
 // ---------------------------------------------------------------- prebuilt files
 
 #[derive(Clone)]
@@ -372,6 +418,8 @@ struct File {
     cc: String,
     etag: String,
     body: Bytes,
+    disk_path: Option<PathBuf>,
+    size: usize,
     pick: ArcSwap<PickTable>,
     ranges: bool,
     /// Prebuilt 304 head up to "date: ".
@@ -473,12 +521,20 @@ fn file_headers(h: &mut Vec<u8>, f: &File, enc: Option<&str>, content_range: Opt
 
 fn build_variant(f: &File, body: Bytes, enc: Option<&'static str>) -> Variant {
     let mut h = Vec::with_capacity(1024);
-    let code = if f.is_404_page { StatusCode::NOT_FOUND } else { StatusCode::OK };
+    let code = if f.is_404_page {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::OK
+    };
     status_line(&mut h, code);
     push_header(&mut h, "content-length", &body.len().to_string());
     file_headers(&mut h, f, enc, None);
     h.extend_from_slice(b"date: ");
-    Variant { body, enc, head: Bytes::from(h) }
+    Variant {
+        body,
+        enc,
+        head: Bytes::from(h),
+    }
 }
 
 fn pick_table(f: &File, br: Option<Bytes>) -> PickTable {
@@ -491,13 +547,17 @@ fn pick_table(f: &File, br: Option<Bytes>) -> PickTable {
 }
 
 fn placeholder() -> PickTable {
-    std::array::from_fn(|_| Variant { body: Bytes::new(), enc: None, head: Bytes::new() })
+    std::array::from_fn(|_| Variant {
+        body: Bytes::new(),
+        enc: None,
+        head: Bytes::new(),
+    })
 }
 
-fn load(root: &Path) -> Files {
+fn load(root: &Path, max_in_memory: usize) -> Files {
     let mut files = Files::default();
     let walker = walkdir_files(root);
-    for (rel, body) in walker {
+    for (rel, path) in walker {
         let ctype = content_type(&rel);
         let lower = rel.to_ascii_lowercase();
         let base = if lower.ends_with(".html") || lower.ends_with(".htm") {
@@ -510,9 +570,25 @@ fn load(root: &Path) -> Files {
         } else {
             base.to_owned()
         };
-        let etag = format!("\"{:016x}\"", fnv1a(&body));
-        let body = Bytes::from(body);
-        let br = (COMPRESSION && compressible(&ctype))
+        let (body, disk_path, size, etag_hash, compress) = if path
+            .metadata()
+            .map(|m| m.len() > max_in_memory as u64)
+            .unwrap_or(false)
+        {
+            let Ok((hash, size)) = hash_file(&path) else {
+                continue;
+            };
+            (Bytes::new(), Some(path), size, hash, false)
+        } else {
+            let Ok(buf) = std::fs::read(&path) else {
+                continue;
+            };
+            let hash = fnv1a(&buf);
+            let size = buf.len();
+            (Bytes::from(buf), None, size, hash, true)
+        };
+        let etag = format!("\"{:016x}\"", etag_hash);
+        let br = (compress && COMPRESSION && compressible(&ctype))
             .then(|| smaller(brotli_of(&body, BROTLI_FAST, BROTLI_MAX_WINDOW), body.len()))
             .flatten();
         let ranges = br.is_none();
@@ -529,6 +605,8 @@ fn load(root: &Path) -> Files {
             cc,
             etag,
             body,
+            disk_path,
+            size,
             pick: ArcSwap::from_pointee(placeholder()),
             ranges,
             not_modified: Bytes::from(nm),
@@ -544,6 +622,8 @@ fn load(root: &Path) -> Files {
             cc: f.cc.clone(),
             etag: f.etag.clone(),
             body: f.body.clone(),
+            disk_path: f.disk_path.clone(),
+            size: f.size,
             pick: ArcSwap::from_pointee(placeholder()),
             ranges: f.ranges,
             not_modified: f.not_modified.clone(),
@@ -568,11 +648,13 @@ fn load(root: &Path) -> Files {
 /// Key no request path can produce (requests always decode from a path starting '/').
 const NOT_FOUND_KEY: &str = "\x00404";
 
-fn walkdir_files(root: &Path) -> Vec<(String, Vec<u8>)> {
+fn walkdir_files(root: &Path) -> Vec<(String, PathBuf)> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for e in rd.flatten() {
             if e.file_name().to_string_lossy().starts_with('.') {
                 continue;
@@ -582,14 +664,15 @@ fn walkdir_files(root: &Path) -> Vec<(String, Vec<u8>)> {
             if ft.is_dir() {
                 stack.push(p);
             } else if ft.is_file() {
-                let Ok(body) = std::fs::read(&p) else { continue };
-                let Ok(rel) = p.strip_prefix(root) else { continue };
+                let Ok(rel) = p.strip_prefix(root) else {
+                    continue;
+                };
                 let rel = rel
                     .components()
                     .map(|c| c.as_os_str().to_string_lossy())
                     .collect::<Vec<_>>()
                     .join("/");
-                out.push((rel, body));
+                out.push((rel, p));
             }
         }
     }
@@ -659,6 +742,8 @@ struct Reply {
     keep_alive: bool,
     /// A body too large to copy into `out`; sent with writev right after it.
     big_body: Option<Bytes>,
+    /// On-disk file to stream after the head (`offset`, `len`).
+    disk: Option<(PathBuf, u64, u64)>,
 }
 
 struct Req<'a> {
@@ -709,7 +794,10 @@ fn read_req<'b>(r: &httparse::Request<'_, 'b>) -> Req<'b> {
             }
         } else if n.eq_ignore_ascii_case("content-length") {
             lengths += 1;
-            match std::str::from_utf8(h.value).ok().and_then(|s| s.trim().parse::<u64>().ok()) {
+            match std::str::from_utf8(h.value)
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+            {
                 Some(0) => {}
                 Some(_) => q.has_body = true,
                 None => q.bad = true,
@@ -752,7 +840,9 @@ fn accept_mask_of(ae: &str) -> usize {
             let p = p.trim();
             // get() rather than [..2]: a non-ASCII byte must not panic (panic = abort)
             p.get(..2).is_some_and(|k| k.eq_ignore_ascii_case("q="))
-                && p.get(2..).and_then(|v| v.trim().parse::<f32>().ok()).is_some_and(|q| q <= 0.0)
+                && p.get(2..)
+                    .and_then(|v| v.trim().parse::<f32>().ok())
+                    .is_some_and(|q| q <= 0.0)
         });
         let slot = if coding.eq_ignore_ascii_case("br") {
             &mut br
@@ -810,9 +900,14 @@ fn finalize(out: &mut Vec<u8>, start: usize, http11: bool, keep_alive: bool) {
     } else {
         return;
     };
-    let Some(end) = out[start..].windows(4).position(|w| w == b"\r\n\r\n") else { return };
+    let Some(end) = out[start..].windows(4).position(|w| w == b"\r\n\r\n") else {
+        return;
+    };
     let head = &out[start..start + end];
-    if head.windows(13).any(|w| w.eq_ignore_ascii_case(b"\r\nconnection:")) {
+    if head
+        .windows(13)
+        .any(|w| w.eq_ignore_ascii_case(b"\r\nconnection:"))
+    {
         return;
     }
     let at = start + end + 2;
@@ -820,9 +915,18 @@ fn finalize(out: &mut Vec<u8>, start: usize, http11: bool, keep_alive: bool) {
 }
 
 fn plain(out: &mut Vec<u8>, code: StatusCode, cc: &str, extra: &[(&str, &str)], head: bool) {
-    let mut h = vec![("content-type", "text/plain; charset=utf-8"), ("cache-control", cc)];
+    let mut h = vec![
+        ("content-type", "text/plain; charset=utf-8"),
+        ("cache-control", cc),
+    ];
     h.extend_from_slice(extra);
-    dynamic(out, code, &h, code.canonical_reason().unwrap_or("").as_bytes(), head);
+    dynamic(
+        out,
+        code,
+        &h,
+        code.canonical_reason().unwrap_or("").as_bytes(),
+        head,
+    );
 }
 
 fn send_variant(out: &mut Vec<u8>, v: &Variant, head: bool) -> Option<Bytes> {
@@ -841,7 +945,11 @@ fn send_variant(out: &mut Vec<u8>, v: &Variant, head: bool) -> Option<Bytes> {
 fn handle(files: &Files, q: &Req, out: &mut Vec<u8>) -> Reply {
     let head = q.method == "HEAD";
     let mut keep = !q.close;
-    let done = |keep| Reply { keep_alive: keep, big_body: None };
+    let done = |keep| Reply {
+        keep_alive: keep,
+        big_body: None,
+        disk: None,
+    };
 
     if q.bad {
         bare_error(out, StatusCode::BAD_REQUEST);
@@ -852,9 +960,17 @@ fn handle(files: &Files, q: &Req, out: &mut Vec<u8>) -> Reply {
         if q.has_body {
             keep = false;
         }
-        const OTHER: [&str; 7] = ["POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE", "CONNECT"];
+        const OTHER: [&str; 7] = [
+            "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE", "CONNECT",
+        ];
         if OTHER.contains(&q.method) {
-            plain(out, StatusCode::METHOD_NOT_ALLOWED, ERROR_CACHE_CONTROL, &[("allow", "GET, HEAD")], false);
+            plain(
+                out,
+                StatusCode::METHOD_NOT_ALLOWED,
+                ERROR_CACHE_CONTROL,
+                &[("allow", "GET, HEAD")],
+                false,
+            );
         } else {
             dynamic(
                 out,
@@ -887,7 +1003,13 @@ fn handle(files: &Files, q: &Req, out: &mut Vec<u8>) -> Reply {
 
     if let Some(dir) = p.strip_suffix("index.html").filter(|d| d.ends_with('/')) {
         let loc = redirect_target(dir) + &query_suffix(query);
-        plain(out, StatusCode::MOVED_PERMANENTLY, REDIRECT_CACHE_CONTROL, &[("location", loc.as_str())], head);
+        plain(
+            out,
+            StatusCode::MOVED_PERMANENTLY,
+            REDIRECT_CACHE_CONTROL,
+            &[("location", loc.as_str())],
+            head,
+        );
         return done(keep);
     }
 
@@ -895,14 +1017,25 @@ fn handle(files: &Files, q: &Req, out: &mut Vec<u8>) -> Reply {
     let Some(f) = files.get(key) else {
         if !p.ends_with('/') && files.contains_key(&format!("{key}/")) {
             let loc = redirect_target(&format!("{p}/")) + &query_suffix(query);
-            plain(out, StatusCode::MOVED_PERMANENTLY, REDIRECT_CACHE_CONTROL, &[("location", loc.as_str())], head);
+            plain(
+                out,
+                StatusCode::MOVED_PERMANENTLY,
+                REDIRECT_CACHE_CONTROL,
+                &[("location", loc.as_str())],
+                head,
+            );
             return done(keep);
         }
         return match files.get(NOT_FOUND_KEY) {
+            Some(page) if page.disk_path.is_some() => send_disk_file(out, page, q, head, keep),
             Some(page) => {
                 let t = page.pick.load();
                 let big = send_variant(out, &t[accept_mask(q.accept_encoding)], head);
-                Reply { keep_alive: keep, big_body: big }
+                Reply {
+                    keep_alive: keep,
+                    big_body: big,
+                    disk: None,
+                }
             }
             None => {
                 plain(out, StatusCode::NOT_FOUND, ERROR_CACHE_CONTROL, &[], head);
@@ -911,10 +1044,17 @@ fn handle(files: &Files, q: &Req, out: &mut Vec<u8>) -> Reply {
         };
     };
 
-    if ETAGS && q.if_none_match.is_some_and(|inm| contains(inm, f.etag.as_bytes())) {
+    if ETAGS
+        && q.if_none_match
+            .is_some_and(|inm| contains(inm, f.etag.as_bytes()))
+    {
         out.extend_from_slice(&f.not_modified);
         push_date_end(out);
         return done(keep);
+    }
+
+    if f.disk_path.is_some() {
+        return send_disk_file(out, f, q, head, keep);
     }
 
     let t = f.pick.load();
@@ -939,7 +1079,11 @@ fn handle(files: &Files, q: &Req, out: &mut Vec<u8>) -> Reply {
                         out.extend_from_slice(&part);
                         return done(keep);
                     }
-                    return Reply { keep_alive: keep, big_body: Some(part) };
+                    return Reply {
+                        keep_alive: keep,
+                        big_body: Some(part),
+                        disk: None,
+                    };
                 }
                 ByteRange::Unsatisfiable => {
                     let cr = format!("bytes */{len}");
@@ -958,7 +1102,95 @@ fn handle(files: &Files, q: &Req, out: &mut Vec<u8>) -> Reply {
     }
 
     let big = send_variant(out, v, head);
-    Reply { keep_alive: keep, big_body: big }
+    Reply {
+        keep_alive: keep,
+        big_body: big,
+        disk: None,
+    }
+}
+
+fn send_disk_file(out: &mut Vec<u8>, f: &File, q: &Req, head: bool, keep: bool) -> Reply {
+    let path = f.disk_path.as_ref().expect("disk file").clone();
+    let mut start = 0u64;
+    let mut len = f.size as u64;
+    let mut code = if f.is_404_page {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::OK
+    };
+    let mut cr: Option<String> = None;
+    if let Some(range) = q.range.filter(|_| f.ranges && !head) {
+        let current = q
+            .if_range
+            .is_none_or(|ir| ir.is_empty() || (ETAGS && ir == f.etag.as_bytes()));
+        if let (true, Ok(range)) = (current, std::str::from_utf8(range)) {
+            match parse_range(range, f.size) {
+                ByteRange::Part(s, e) => {
+                    cr = Some(format!("bytes {s}-{e}/{}", f.size));
+                    start = s as u64;
+                    len = (e - s + 1) as u64;
+                    code = StatusCode::PARTIAL_CONTENT;
+                }
+                ByteRange::Unsatisfiable => {
+                    let cr = format!("bytes */{}", f.size);
+                    plain(
+                        out,
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                        ERROR_CACHE_CONTROL,
+                        &[("accept-ranges", "bytes"), ("content-range", cr.as_str())],
+                        false,
+                    );
+                    return Reply {
+                        keep_alive: keep,
+                        big_body: None,
+                        disk: None,
+                    };
+                }
+                ByteRange::Ignore => {}
+            }
+        }
+    }
+    status_line(out, code);
+    push_header(out, "content-length", &len.to_string());
+    file_headers(out, f, None, cr.as_deref());
+    out.extend_from_slice(b"date: ");
+    push_date_end(out);
+    if head || len == 0 {
+        return Reply {
+            keep_alive: keep,
+            big_body: None,
+            disk: None,
+        };
+    }
+    Reply {
+        keep_alive: keep,
+        big_body: None,
+        disk: Some((path, start, len)),
+    }
+}
+
+async fn stream_disk(s: &mut TcpStream, path: &Path, offset: u64, len: u64) -> bool {
+    let mut f = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    if offset > 0 && f.seek(std::io::SeekFrom::Start(offset)).await.is_err() {
+        return false;
+    }
+    let mut left = len;
+    let mut buf = vec![0u8; 64 * 1024];
+    while left > 0 {
+        let n = std::cmp::min(left, buf.len() as u64) as usize;
+        let n = match timeout(WRITE_TIMEOUT, f.read(&mut buf[..n])).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return false,
+            Ok(Ok(n)) => n,
+        };
+        if write_two(s, &buf[..n], &[]).await.is_err() {
+            return false;
+        }
+        left -= n as u64;
+    }
+    true
 }
 
 // ---------------------------------------------------------------- connection loop
@@ -995,8 +1227,12 @@ async fn flush(s: &mut TcpStream, out: &mut Vec<u8>, body: &[u8]) -> bool {
     ok
 }
 
-async fn connection(mut s: TcpStream, files: &'static Files, mut stop: watch::Receiver<bool>) {
-    let _counted = Counted::new();
+async fn connection(
+    mut s: TcpStream,
+    files: &'static Files,
+    mut stop: watch::Receiver<bool>,
+    _counted: Counted,
+) {
     let _ = s.set_nodelay(true);
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     let mut out: Vec<u8> = Vec::with_capacity(16 * 1024);
@@ -1047,6 +1283,13 @@ async fn connection(mut s: TcpStream, files: &'static Files, mut stop: watch::Re
                 if !flush(&mut s, &mut out, &body).await {
                     return;
                 }
+            } else if let Some((path, off, len)) = reply.disk {
+                if !flush(&mut s, &mut out, &[]).await {
+                    return;
+                }
+                if !stream_disk(&mut s, &path, off, len).await {
+                    return;
+                }
             }
             if !reply.keep_alive {
                 let _ = flush(&mut s, &mut out, &[]).await;
@@ -1074,7 +1317,11 @@ async fn connection(mut s: TcpStream, files: &'static Files, mut stop: watch::Re
         }
         let wait = if buf.is_empty() {
             head_started = None;
-            if answered { KEEP_ALIVE } else { REQUEST_HEAD_TIMEOUT }
+            if answered {
+                KEEP_ALIVE
+            } else {
+                REQUEST_HEAD_TIMEOUT
+            }
         } else {
             let started = *head_started.get_or_insert_with(Instant::now);
             match REQUEST_HEAD_TIMEOUT.checked_sub(started.elapsed()) {
@@ -1103,7 +1350,7 @@ fn listener(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
     s.set_tcp_nodelay(true)?;
     s.set_nonblocking(true)?;
     s.bind(&addr.into())?;
-    s.listen(65_535)?;
+    s.listen(1024)?;
     Ok(s.into())
 }
 
@@ -1140,17 +1387,26 @@ fn main() {
         eprintln!("bad PORT: {e}");
         std::process::exit(1);
     });
-    match rlimit::increase_nofile_limit(u64::MAX) {
+    let max_in_memory = env_usize("MAX_IN_MEMORY", DEFAULT_MAX_IN_MEMORY);
+    let max_connections = env_usize("MAX_CONNECTIONS", DEFAULT_MAX_CONNECTIONS);
+    let nofile = (max_connections as u64).saturating_add(512).max(8192);
+    match rlimit::increase_nofile_limit(nofile) {
         Ok(n) => println!("open file limit: {n}"),
         Err(e) => eprintln!("could not raise open file limit: {e}"),
     }
-    let files: &'static Files = Box::leak(Box::new(load(Path::new(&root))));
+    let files: &'static Files = Box::leak(Box::new(load(Path::new(&root), max_in_memory)));
     let count = files.keys().filter(|k| !is_folder_key(k)).count();
     if count == 0 {
         eprintln!("no files found under {root}");
         std::process::exit(1);
     }
-    println!("loaded {count} files from {root}");
+    let mem = files
+        .iter()
+        .filter(|(k, f)| !is_folder_key(k) && f.disk_path.is_none())
+        .count();
+    let disk = count - mem;
+    println!("loaded {count} files from {root} ({mem} in memory, {disk} served from disk)");
+    println!("max in-memory file: {max_in_memory} bytes, max connections: {max_connections}");
     return_large_blocks_when_freed();
     return_freed_memory_to_the_system();
     if COMPRESSION {
@@ -1160,9 +1416,16 @@ fn main() {
         });
     }
 
-    let host = std::env::var("HOST").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| {
-        if std::net::TcpListener::bind(("::", 0)).is_ok() { "::".to_owned() } else { "0.0.0.0".to_owned() }
-    });
+    let host = std::env::var("HOST")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| {
+            if std::net::TcpListener::bind(("::", 0)).is_ok() {
+                "::".to_owned()
+            } else {
+                "0.0.0.0".to_owned()
+            }
+        });
     let addr: SocketAddr = match host.parse::<std::net::IpAddr>() {
         Ok(ip) => SocketAddr::new(ip, port),
         Err(_) => {
@@ -1206,7 +1469,9 @@ fn main() {
                     loop {
                         tokio::select! {
                             r = l.accept() => if let Ok((s, _)) = r {
-                                tokio::spawn(connection(s, files, stop.clone()));
+                                if let Some(counted) = Counted::try_new(max_connections) {
+                                    tokio::spawn(connection(s, files, stop.clone(), counted));
+                                }
                             },
                             _ = stop.changed() => break,
                         }
@@ -1227,14 +1492,18 @@ fn main() {
         .build()
         .unwrap()
         .block_on(async {
-            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("SIGTERM handler");
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("SIGTERM handler");
             tokio::select! {
                 _ = term.recv() => {}
                 _ = tokio::signal::ctrl_c() => {}
             }
         });
-    println!("shutting down: finishing in-flight requests (up to {} s)", SHUTDOWN_TIMEOUT.as_secs());
+    println!(
+        "shutting down: finishing in-flight requests (up to {} s)",
+        SHUTDOWN_TIMEOUT.as_secs()
+    );
     SHUTTING_DOWN.store(true, Ordering::SeqCst);
     for stop_tx in &stop_txs {
         let _ = stop_tx.send(true);

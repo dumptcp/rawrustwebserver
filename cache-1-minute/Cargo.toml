@@ -10,7 +10,7 @@ path = "main.rs"
 [dependencies]
 arc-swap = "1"
 brotli = "9"
-bytes = "1"
+bytes = "1.12.2"
 http = "1"
 httparse = "1"
 httpdate = "1"
@@ -18,7 +18,7 @@ mime_guess = "2"
 percent-encoding = "2"
 rlimit = "0.11"
 socket2 = { version = "0.6", features = ["all"] }
-tokio = { version = "1", features = ["rt", "net", "time", "io-util", "signal", "sync", "macros"] }
+tokio = { version = "1", features = ["rt", "net", "time", "io-util", "fs", "signal", "sync", "macros"] }
 
 [profile.release]
 opt-level = 3
