@@ -57,7 +57,7 @@ Each folder is a complete, standalone server. Pick **one**:
 | Folder | Compression | HTML Cache | Asset Cache | Best For |
 |---|---|---|---|---|
 | `cache-assets-only/` | ✅ Yes | None (always fresh, revalidated with ETag) | 1 year | **Recommended.** Most sites |
-| `cache-all/` | ✅ Yes | None (always fresh, revalidated with ETag) | 1 year for `/assets/`, other files revalidated | Hashed asset names in `/assets/` |
+| `cache-all/` | ✅ Yes | 1 year | 1 year | Whole site cached for a year |
 | `cache-1-minute/` | ✅ Yes | 1 minute | 1 year | News sites, blogs |
 | `no-cache/` | ❌ No | None | None | Dev, debugging |
 | `no-cache+compression/` | ✅ Yes | None | None | Fresh + small downloads |
@@ -68,7 +68,7 @@ Each folder is a complete, standalone server. Pick **one**:
 All eight folders contain the same code. The only difference is the **settings** block at the top of each `main.rs`, which sets that version's compression, ETags and cache times.
 
 **Legend:**
-- **Compression ✅** = Text files (HTML, CSS, JS, SVG, JSON, ...) are pre-compressed with Brotli at the strongest level, and the server sends that to every request that accepts Brotli; every other request gets the file as-is. Cloudflare always asks your server for Brotli and passes it on to visitors unchanged; for the few that can't read Brotli, Cloudflare sends the uncompressed file. The site is online right away; the strongest compression finishes in the background shortly after.
+- **Compression ✅** = Text files (HTML, CSS, JS, SVG, JSON, ...) up to 2 MB are pre-compressed with Brotli at the strongest level, and the server sends that to every request that accepts Brotli; every other request gets the file as-is. Files larger than 2 MB are sent as stored and are not Brotli-compressed. Cloudflare always asks your server for Brotli and passes it on to visitors unchanged; for the few that can't read Brotli, Cloudflare sends the uncompressed file. The site is online right away; the strongest compression finishes in the background shortly after.
 - **Compression ❌** = The server sends files as-is and does no compressing itself, so it uses less CPU at startup.
 - **HTML Cache** = How long browsers keep your `index.html`. "None" means every visit gets the latest version.
 - **Asset Cache** = How long browsers keep images, CSS, and JS. "1 year" is standard.
@@ -224,12 +224,12 @@ cargo clean
 
 - This is a **static** server. It serves HTML, CSS, JS, images, and other files. It does **not** run PHP, Python, or any other server-side code.
 - It only answers requests that read a page or a file (`GET` and `HEAD`). A form or script that tries to send data to it (`POST`, `PUT`, `DELETE`, ...) gets `405 Method Not Allowed`.
-- Files are loaded into memory once at startup. After changing anything in `www`, restart the server (`Ctrl+C`, then start it again). You only need to rebuild when `main.rs` or `Cargo.toml` changes.
+- Files up to 2 MB are loaded into memory once at startup. Larger files are streamed from disk and are not Brotli-compressed. After changing anything in `www`, restart the server (`Ctrl+C`, then start it again). You only need to rebuild when `main.rs` or `Cargo.toml` changes.
 - Only one copy can run on a port. If an old copy is still running, a new one stops with `Address already in use`, so visitors are never split between an old and a new version of your site.
 - `/about` and `/about/` both open `about/index.html`.
 - To show your own "page not found" page, put a `404.html` in the top of `www`. Inside it, start links to your CSS and images with `/` (for example `/style.css`), because the page is shown at many different addresses.
 - Pages can only load things from your own site unless you allow more. If you use Google Fonts, analytics, a CDN or embeds, see the next section.
-- Images, CSS, JS and every other file that isn't a page are cached for a year in each `cache-*` version (in `cache-all` only files under `/assets/`; everything else there is revalidated with its ETag). When you change one, give it a new name or link to it with `?v=2`, then purge Cloudflare's cache (Caching → Configuration → Purge Everything), or returning visitors keep the old copy.
+- Images, CSS, JS and every other file that isn't a page are cached for a year in each `cache-*` version. `cache-all` caches HTML for a year too, so after you update the site, purge Cloudflare's cache (Caching → Configuration → Purge Everything) or returning visitors keep the old pages. When you change a long-cached file, give it a new name or link to it with `?v=2`, then purge Cloudflare the same way.
 - `cache-assets-only` is the safest choice for most people.
 - Every response tells browsers to use HTTPS for a year on your domain **and all its subdomains** (`Strict-Transport-Security` with `includeSubDomains`). Make sure every subdomain works over HTTPS (with Cloudflare proxying them, they do). Otherwise, remove `; includeSubDomains` from `strict-transport-security` in `main.rs`.
 - `cloudflare.conf` lists Cloudflare's addresses as published at [cloudflare.com/ips](https://www.cloudflare.com/ips/). They rarely change, but if Cloudflare adds one, update both lists in the file and load it again.
